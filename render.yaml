@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: gongkan
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: APP_USERNAME
+        value: gongkan
+      - key: APP_PASSWORD
+        sync: false
+      - key: MCP_PATH_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_BASE_URL
+        value: https://generativelanguage.googleapis.com
+      - key: GEMINI_MODEL
+        sync: false
+      - key: GEMINI_FALLBACK_MODEL
+        value: ""
+      - key: MAX_UPLOAD_MB
+        value: "80"
+      - key: MAX_DURATION_SECONDS
+        value: "60"
+      - key: GEMINI_INLINE_TARGET_MB
+        value: "14"
