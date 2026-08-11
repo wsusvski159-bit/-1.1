@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: gongkan
+    name: gongkan-public
     runtime: docker
     plan: free
     healthCheckPath: /health
@@ -11,17 +11,33 @@ services:
         sync: false
       - key: MCP_PATH_TOKEN
         sync: false
-      - key: GEMINI_API_KEY
+
+      # gemini = 原生视频+音轨理解（推荐）
+      # openai = 抽帧 + 音频转写的兼容模式
+      - key: API_MODE
         sync: false
-      - key: GEMINI_BASE_URL
-        value: https://generativelanguage.googleapis.com
-      - key: GEMINI_MODEL
+      - key: API_KEY
         sync: false
-      - key: GEMINI_FALLBACK_MODEL
+      - key: API_BASE_URL
+        sync: false
+      - key: API_MODEL
+        sync: false
+
+      # 可选：主模型失败时备用；留空即可
+      - key: API_FALLBACK_MODEL
         value: ""
+      # OpenAI-compatible 模式用；不需要语音转写可留空
+      - key: API_AUDIO_MODEL
+        value: whisper-1
+      # Gemini-compatible 默认用 ?key=；少数中转如果要求 Bearer，可部署后改成 bearer
+      - key: GEMINI_AUTH_STYLE
+        value: query_key
+
       - key: MAX_UPLOAD_MB
         value: "80"
       - key: MAX_DURATION_SECONDS
         value: "60"
       - key: GEMINI_INLINE_TARGET_MB
         value: "14"
+      - key: OPENAI_FRAME_COUNT
+        value: "8"

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -21,13 +20,13 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or "").strip()
+def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if check and p.returncode != 0:
+        stderr = (p.stderr or "").strip()
         tail = stderr[-1800:] if stderr else "没有收到 FFmpeg 的详细错误输出。"
-        raise RuntimeError(f"FFmpeg 处理失败：{tail}") from e
+        raise RuntimeError(f"FFmpeg 处理失败：{tail}")
+    return p
 
 
 def ensure_ffmpeg() -> None:
@@ -47,19 +46,11 @@ def probe_duration(video_path: Path) -> float:
 
 
 def _transcode_for_inline(video_path: Path, work_dir: Path, duration: float, target_mb: float) -> Path:
-    """准备适合 Gemini-compatible API inline_data 的 MP4。
-
-    小体积 MP4 直接发送，避免 Render 免费实例为了"再压一次"而白白消耗 CPU/RAM。
-    只有文件偏大时才低资源转码。
-    """
     target_bytes = max(4, int(target_mb * 1024 * 1024))
-
-    # 手机拍出来的短 MP4 如果本来就够小，直接交给 Gemini。
-    # 这也是最稳的路径：不改画面、不改声音、不额外吃 Render 资源。
     if video_path.suffix.lower() in {".mp4", ".m4v"} and video_path.stat().st_size <= target_bytes:
         return video_path
 
-    out = work_dir / "gemini-input.mp4"
+    out = work_dir / "model-input.mp4"
     if duration > 0.3:
         total_kbps = int((target_bytes * 8 / duration) / 1000 * 0.82)
         total_kbps = max(420, min(total_kbps, 1800))
@@ -77,37 +68,58 @@ def _transcode_for_inline(video_path: Path, work_dir: Path, duration: float, tar
             "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-pix_fmt", "yuv420p",
             "-b:v", f"{v_kbps}k", "-maxrate", f"{int(v_kbps * 1.15)}k", "-bufsize", f"{int(v_kbps * 1.5)}k",
             "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ac", "1", "-ar", "32000",
-            "-movflags", "+faststart",
-            str(out),
+            "-movflags", "+faststart", str(out),
         ])
 
     encode(video_kbps)
     if not out.exists() or out.stat().st_size == 0:
         raise RuntimeError("视频转码失败。请换一个常见视频格式（如 MP4/H.264）再试。")
-
-    # 如果估算仍偏大，再压一次；继续保持单线程，优先兼容 Render Free。
     if out.stat().st_size > target_bytes * 1.12:
         encode(max(260, int(video_kbps * 0.62)))
-
     return out
 
-def _api_settings() -> tuple[str, str, str, str]:
-    # 公共版不内置任何人的 Key。优先使用通用变量名，同时兼容早期 NEWAPI_* 变量。
-    api_key = (os.getenv("GEMINI_API_KEY", "") or os.getenv("NEWAPI_API_KEY", "")).strip()
+
+def _settings() -> dict[str, str]:
+    mode = os.getenv("API_MODE", "gemini").strip().lower()
+    if mode not in {"gemini", "openai"}:
+        raise RuntimeError("API_MODE 只能填 gemini 或 openai。")
+
+    # 新公共变量名；同时兼容旧版环境变量，方便升级不丢配置。
+    api_key = (
+        os.getenv("API_KEY", "")
+        or os.getenv("GEMINI_API_KEY", "")
+        or os.getenv("NEWAPI_API_KEY", "")
+    ).strip()
     if not api_key:
-        raise RuntimeError("还没有配置 GEMINI_API_KEY（或兼容变量 NEWAPI_API_KEY）。")
+        raise RuntimeError("还没有配置 API_KEY。")
 
     base_url = (
-        os.getenv("GEMINI_BASE_URL", "")
+        os.getenv("API_BASE_URL", "")
+        or os.getenv("GEMINI_BASE_URL", "")
         or os.getenv("NEWAPI_BASE_URL", "")
-        or "https://generativelanguage.googleapis.com"
     ).strip().rstrip("/")
-    primary = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    fallback = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
-    return api_key, base_url, primary, fallback
+    if not base_url:
+        raise RuntimeError("还没有配置 API_BASE_URL。")
+
+    model = (os.getenv("API_MODEL", "") or os.getenv("GEMINI_MODEL", "")).strip()
+    if not model:
+        raise RuntimeError("还没有配置 API_MODEL。")
+
+    fallback = (os.getenv("API_FALLBACK_MODEL", "") or os.getenv("GEMINI_FALLBACK_MODEL", "")).strip()
+    audio_model = os.getenv("API_AUDIO_MODEL", "whisper-1").strip()
+    auth_style = os.getenv("GEMINI_AUTH_STYLE", "query_key").strip().lower()
+    return {
+        "mode": mode,
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+        "fallback": fallback,
+        "audio_model": audio_model,
+        "auth_style": auth_style,
+    }
 
 
-def _prompt(duration: float) -> str:
+def _prompt_direct(duration: float) -> str:
     return f"""
 你正在观看并聆听一段约 {duration:.1f} 秒的短视频。请同时使用视频画面和视频原始音轨来理解它。
 
@@ -135,20 +147,66 @@ def _prompt(duration: float) -> str:
 """.strip()
 
 
-def _extract_response_text(data: dict[str, Any]) -> str:
-    candidates = data.get("candidates") or []
-    for candidate in candidates:
-        content = (candidate or {}).get("content") or {}
-        parts = content.get("parts") or []
+def _prompt_frames(duration: float, transcript: str, frame_count: int, audio_warning: str = "") -> str:
+    transcript_block = transcript.strip() or "（没有可用的语音转写。）"
+    warning_block = audio_warning.strip() or "无"
+    return f"""
+你将看到从一段约 {duration:.1f} 秒视频中按时间均匀抽取的 {frame_count} 张画面截图，并得到该视频音轨的自动语音转写。
+
+注意：你没有收到完整连续视频，也没有直接听到原始音轨。因此不能声称看见截图之间未出现的动作，也不能凭转写判断音乐、笑声、语气或环境音。只能根据截图与转写做保守分析。
+
+语音转写：
+{transcript_block}
+
+音频处理提示：
+{warning_block}
+
+请只返回一个 JSON 对象，不要 Markdown 代码块，字段必须为：
+{{
+  "summary": "一句话概括",
+  "timeline": [{{"time": "约 0:05", "event": "可由截图或转写支持的关键事件"}}],
+  "visual": "截图中明确可见的画面、人物/物体、场景、可确认文字",
+  "audio": "只根据语音转写描述可确认的台词；无法确认的声音特征明确说明",
+  "transcript": "保留或整理语音转写",
+  "av_relationship": "仅在截图和转写足以支持时描述音画对应，否则说明无法确定",
+  "discussion_points": ["最值得一起聊的点"],
+  "uncertainty": ["由于使用抽帧/转写而无法确定的地方"]
+}}
+""".strip()
+
+
+def _extract_gemini_text(data: dict[str, Any]) -> str:
+    for candidate in data.get("candidates") or []:
+        parts = ((candidate or {}).get("content") or {}).get("parts") or []
         texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]
         if texts:
             return "\n".join(texts).strip()
-    # 让报错信息可读，但不要把鉴权信息带出来。
     if data.get("error"):
         err = data["error"]
         if isinstance(err, dict):
             raise RuntimeError(str(err.get("message") or err.get("status") or "Gemini API 返回错误"))
-    raise RuntimeError("Gemini 没有返回可读内容。")
+    raise RuntimeError("Gemini-compatible API 没有返回可读内容。")
+
+
+def _extract_openai_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if choices:
+        content = ((choices[0] or {}).get("message") or {}).get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if text:
+                        texts.append(str(text))
+            if texts:
+                return "\n".join(texts).strip()
+    err = data.get("error")
+    if isinstance(err, dict):
+        raise RuntimeError(str(err.get("message") or err.get("type") or "OpenAI-compatible API 返回错误"))
+    raise RuntimeError("OpenAI-compatible API 没有返回可读内容。")
 
 
 def _parse_json_text(text: str) -> dict[str, Any]:
@@ -163,10 +221,7 @@ def _parse_json_text(text: str) -> dict[str, Any]:
             return parsed
     except Exception:
         pass
-
-    # 容错：有些中转会在 JSON 前后加一句话。
-    start = raw.find("{")
-    end = raw.rfind("}")
+    start, end = raw.find("{"), raw.rfind("}")
     if start >= 0 and end > start:
         try:
             parsed = json.loads(raw[start:end + 1])
@@ -174,7 +229,6 @@ def _parse_json_text(text: str) -> dict[str, Any]:
                 return parsed
         except Exception:
             pass
-
     return {
         "summary": "模型返回了非 JSON 格式的观察。",
         "timeline": [],
@@ -187,50 +241,177 @@ def _parse_json_text(text: str) -> dict[str, Any]:
     }
 
 
-def _call_gemini(video_mp4: Path, duration: float, model: str, api_key: str, base_url: str) -> dict[str, Any]:
+def _http_error(resp: httpx.Response, api_key: str, label: str) -> RuntimeError:
+    message = ""
+    try:
+        body = resp.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            message = str(err.get("message") or err.get("status") or err.get("type") or "")
+        elif isinstance(body, dict):
+            message = str(body.get("message") or "")
+    except Exception:
+        message = resp.text[:500]
+    if api_key:
+        message = message.replace(api_key, "***")
+    return RuntimeError(f"{label} 请求失败（HTTP {resp.status_code}）：{message or '上游没有给出详细原因'}")
+
+
+def _call_gemini(video_mp4: Path, duration: float, model: str, api_key: str, base_url: str, auth_style: str) -> dict[str, Any]:
     encoded = base64.b64encode(video_mp4.read_bytes()).decode("ascii")
     url = f"{base_url}/v1beta/models/{model}:generateContent"
     payload = {
         "contents": [{
             "role": "user",
             "parts": [
-                {"text": _prompt(duration)},
+                {"text": _prompt_direct(duration)},
                 {"inline_data": {"mime_type": "video/mp4", "data": encoded}},
             ],
         }],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }
-
+    params = {"key": api_key} if auth_style != "bearer" else None
+    headers = {"Authorization": f"Bearer {api_key}"} if auth_style == "bearer" else None
     try:
         with httpx.Client(timeout=httpx.Timeout(240.0, connect=30.0)) as client:
-            resp = client.post(url, params={"key": api_key}, json=payload)
+            resp = client.post(url, params=params, headers=headers, json=payload)
     except httpx.RequestError as e:
-        raise RuntimeError(f"连接视频 API 失败：{e.__class__.__name__}") from e
-
+        raise RuntimeError(f"连接 Gemini-compatible API 失败：{e.__class__.__name__}") from e
     if resp.status_code >= 400:
-        message = ""
-        try:
-            body = resp.json()
-            err = body.get("error") if isinstance(body, dict) else None
-            if isinstance(err, dict):
-                message = str(err.get("message") or err.get("status") or "")
-            elif isinstance(body, dict):
-                message = str(body.get("message") or "")
-        except Exception:
-            message = resp.text[:500]
-        message = message.replace(api_key, "***") if api_key else message
-        raise RuntimeError(f"{model} 请求失败（HTTP {resp.status_code}）：{message or '上游没有给出详细原因'}")
-
+        raise _http_error(resp, api_key, model)
     try:
         data = resp.json()
     except Exception as e:
-        raise RuntimeError("视频 API 返回的不是 JSON。") from e
+        raise RuntimeError("Gemini-compatible API 返回的不是 JSON。") from e
+    return _parse_json_text(_extract_gemini_text(data))
 
-    text = _extract_response_text(data)
-    return _parse_json_text(text)
+
+def _openai_endpoint(base_url: str, path: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1") and path.startswith("/v1/"):
+        return base + path[3:]
+    if not base.endswith("/v1") and path.startswith("/v1/"):
+        return base + path
+    return base + "/" + path.lstrip("/")
+
+
+def _extract_openai_frames(video_path: Path, work_dir: Path, duration: float, max_frames: int = 8) -> list[Path]:
+    frame_dir = work_dir / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    count = max(2, min(max_frames, 10))
+    if duration <= 0.5:
+        times = [0.0]
+    else:
+        start = min(0.15, duration * 0.05)
+        end = max(start, duration - min(0.15, duration * 0.05))
+        if count == 1:
+            times = [(start + end) / 2]
+        else:
+            times = [start + (end - start) * i / (count - 1) for i in range(count)]
+
+    frames: list[Path] = []
+    for i, t in enumerate(times, 1):
+        out = frame_dir / f"frame-{i:02d}.jpg"
+        p = _run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{t:.3f}", "-i", str(video_path), "-frames:v", "1",
+            "-vf", "scale='min(960,iw)':-2:force_original_aspect_ratio=decrease",
+            "-q:v", "4", str(out),
+        ], check=False)
+        if p.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            frames.append(out)
+    if not frames:
+        raise RuntimeError("没有成功抽取视频画面，OpenAI-compatible 模式无法继续。")
+    return frames
+
+
+def _extract_audio_wav(video_path: Path, work_dir: Path) -> Path | None:
+    out = work_dir / "audio.wav"
+    p = _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out),
+    ], check=False)
+    if p.returncode != 0 or not out.exists() or out.stat().st_size < 1000:
+        return None
+    return out
+
+
+def _openai_transcribe(audio_path: Path | None, api_key: str, base_url: str, audio_model: str) -> tuple[str, str]:
+    if audio_path is None:
+        return "", "视频没有检测到可用音轨，或音轨提取失败。"
+    if not audio_model:
+        return "", "未配置 API_AUDIO_MODEL，因此跳过语音转写。"
+
+    url = _openai_endpoint(base_url, "/v1/audio/transcriptions")
+    try:
+        with audio_path.open("rb") as f, httpx.Client(timeout=httpx.Timeout(180.0, connect=30.0)) as client:
+            resp = client.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                data={"model": audio_model, "response_format": "json"},
+                files={"file": ("audio.wav", f, "audio/wav")},
+            )
+    except httpx.RequestError as e:
+        return "", f"语音转写连接失败：{e.__class__.__name__}。"
+    if resp.status_code >= 400:
+        err = _http_error(resp, api_key, audio_model)
+        return "", f"语音转写不可用：{err}"
+    try:
+        data = resp.json()
+        text = str(data.get("text") or "").strip()
+        return text, ""
+    except Exception:
+        return "", "语音转写接口返回格式无法读取。"
+
+
+def _call_openai_frames(video_path: Path, duration: float, model: str, api_key: str, base_url: str, audio_model: str, work_dir: Path) -> dict[str, Any]:
+    frames = _extract_openai_frames(video_path, work_dir, duration, int(os.getenv("OPENAI_FRAME_COUNT", "8")))
+    audio_path = _extract_audio_wav(video_path, work_dir)
+    transcript, audio_warning = _openai_transcribe(audio_path, api_key, base_url, audio_model)
+
+    content: list[dict[str, Any]] = [{
+        "type": "text",
+        "text": _prompt_frames(duration, transcript, len(frames), audio_warning),
+    }]
+    for frame in frames:
+        data_url = "data:image/jpeg;base64," + base64.b64encode(frame.read_bytes()).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": data_url, "detail": "low"}})
+
+    url = _openai_endpoint(base_url, "/v1/chat/completions")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        with httpx.Client(timeout=httpx.Timeout(240.0, connect=30.0)) as client:
+            resp = client.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=payload)
+    except httpx.RequestError as e:
+        raise RuntimeError(f"连接 OpenAI-compatible API 失败：{e.__class__.__name__}") from e
+
+    # 部分兼容网关不支持 response_format，自动再试一次。
+    if resp.status_code >= 400 and resp.status_code in {400, 404, 422}:
+        payload.pop("response_format", None)
+        with httpx.Client(timeout=httpx.Timeout(240.0, connect=30.0)) as client:
+            resp = client.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=payload)
+    if resp.status_code >= 400:
+        raise _http_error(resp, api_key, model)
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError("OpenAI-compatible API 返回的不是 JSON。") from e
+
+    obs = _parse_json_text(_extract_openai_text(data))
+    if not obs.get("transcript") and transcript:
+        obs["transcript"] = transcript
+    if audio_warning:
+        uncertainty = obs.get("uncertainty")
+        if not isinstance(uncertainty, list):
+            uncertainty = [] if not uncertainty else [str(uncertainty)]
+        uncertainty.append(audio_warning)
+        obs["uncertainty"] = uncertainty
+    return obs
 
 
 def _timeline_text(items: Any) -> str:
@@ -271,7 +452,7 @@ def _compose_analysis(obs: dict[str, Any]) -> str:
 
 def analyze_video(video_path: Path, original_name: str) -> dict[str, Any]:
     ensure_ffmpeg()
-    api_key, base_url, primary_model, fallback_model = _api_settings()
+    cfg = _settings()
 
     max_duration = float(os.getenv("MAX_DURATION_SECONDS", "60"))
     max_upload_mb = float(os.getenv("MAX_UPLOAD_MB", "80"))
@@ -287,55 +468,64 @@ def analyze_video(video_path: Path, original_name: str) -> dict[str, Any]:
 
     work_dir = TMP_DIR / f"job-{uuid.uuid4().hex}"
     work_dir.mkdir(parents=True, exist_ok=True)
+    fallback_error = None
+    used_model = cfg["model"]
     try:
-        prepared = _transcode_for_inline(video_path, work_dir, duration, inline_target_mb)
-        prepared_mb = prepared.stat().st_size / (1024 * 1024)
-        # Google generateContent 的 inline 视频适合小请求；留出 base64/JSON 的空间。
-        if prepared_mb > inline_target_mb * 1.25:
-            raise RuntimeError(f"自动压缩后仍有 {prepared_mb:.1f}MB，暂时不适合 inline 视频请求。请把视频再剪短一点。")
-
-        used_model = primary_model
-        fallback_error = None
-        try:
-            obs = _call_gemini(prepared, duration, primary_model, api_key, base_url)
-        except Exception as first_error:
-            if fallback_model and fallback_model != primary_model:
-                fallback_error = str(first_error)
-                used_model = fallback_model
-                obs = _call_gemini(prepared, duration, fallback_model, api_key, base_url)
-            else:
-                raise
+        if cfg["mode"] == "gemini":
+            prepared = _transcode_for_inline(video_path, work_dir, duration, inline_target_mb)
+            prepared_mb = prepared.stat().st_size / (1024 * 1024)
+            if prepared_mb > inline_target_mb * 1.25:
+                raise RuntimeError(f"自动压缩后仍有 {prepared_mb:.1f}MB，暂时不适合 inline 视频请求。请把视频再剪短一点。")
+            try:
+                obs = _call_gemini(prepared, duration, cfg["model"], cfg["api_key"], cfg["base_url"], cfg["auth_style"])
+            except Exception as first_error:
+                if cfg["fallback"] and cfg["fallback"] != cfg["model"]:
+                    fallback_error = str(first_error)
+                    used_model = cfg["fallback"]
+                    obs = _call_gemini(prepared, duration, used_model, cfg["api_key"], cfg["base_url"], cfg["auth_style"])
+                else:
+                    raise
+            pipeline = "Gemini-compatible：小 MP4 直接发送，较大视频低资源压缩 → 模型直接读取视频画面与原始音轨 → 保存音画报告"
+        else:
+            try:
+                obs = _call_openai_frames(video_path, duration, cfg["model"], cfg["api_key"], cfg["base_url"], cfg["audio_model"], work_dir)
+            except Exception as first_error:
+                if cfg["fallback"] and cfg["fallback"] != cfg["model"]:
+                    fallback_error = str(first_error)
+                    used_model = cfg["fallback"]
+                    obs = _call_openai_frames(video_path, duration, used_model, cfg["api_key"], cfg["base_url"], cfg["audio_model"], work_dir)
+                else:
+                    raise
+            pipeline = "OpenAI-compatible：FFmpeg 均匀抽取关键帧 + 可用时调用音频转写接口 → 视觉模型结合截图与转写生成报告。不是原生连续视频理解。"
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     video_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     transcript = str(obs.get("transcript") or "").strip()
     audio_obs = str(obs.get("audio") or "").strip()
-    final_analysis = _compose_analysis(obs)
-
     report = {
         "video_id": video_id,
         "original_name": original_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "duration_seconds": round(duration, 3),
         "size_mb": round(size_mb, 3),
-        "analysis": final_analysis,
-        "transcript": transcript or "（没有得到清晰语音转写；请看声音观察。）",
+        "analysis": _compose_analysis(obs),
+        "transcript": transcript or "（没有得到清晰语音转写；请看声音观察与不确定项。）",
         "audio_observation": audio_obs or "（模型没有单独返回声音观察。）",
         "frame_times_seconds": [],
         "models": {
+            "provider_mode": cfg["mode"],
             "video_audio_understanding": used_model,
-            "primary": primary_model,
-            "fallback": fallback_model,
+            "primary": cfg["model"],
+            "fallback": cfg["fallback"],
+            "audio_transcription": cfg["audio_model"] if cfg["mode"] == "openai" else "",
         },
-        "pipeline": "小 MP4 直接发送；较大视频才用低资源 FFmpeg 压缩 → Gemini-compatible API inline_data 同时看画面+听音轨 → 保存音画报告",
-        "gateway": base_url,
+        "pipeline": pipeline,
+        "gateway": cfg["base_url"],
         "primary_model_error_before_fallback": fallback_error,
         "raw_structured_observation": obs,
     }
-    (REPORTS_DIR / f"{video_id}.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    (REPORTS_DIR / f"{video_id}.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 
 

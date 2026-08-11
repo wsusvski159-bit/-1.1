@@ -122,8 +122,9 @@ def page(message: str = "") -> str:
         )
 
     msg = f'<div class="msg">{html.escape(message)}</div>' if message else ""
-    api_ok = bool((os.getenv("GEMINI_API_KEY", "") or os.getenv("NEWAPI_API_KEY", "")).strip())
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    api_ok = bool((os.getenv("API_KEY", "") or os.getenv("GEMINI_API_KEY", "") or os.getenv("NEWAPI_API_KEY", "")).strip())
+    api_mode = os.getenv("API_MODE", "gemini").strip().lower()
+    model = (os.getenv("API_MODEL", "") or os.getenv("GEMINI_MODEL", "") or "未配置").strip()
 
     model_dot = "✓" if api_ok else "!"
     password_dot = "✓" if APP_PASSWORD else "!"
@@ -140,7 +141,7 @@ def page(message: str = "") -> str:
   <div class="status-item"><span class="dot">{model_dot}</span><span class="status-label">视频理解</span></div>
   <div class="status-item"><span class="dot{password_cls}">{password_dot}</span><span class="status-label">网页保护</span></div>
   <div class="status-item"><span class="dot{mcp_cls}">{mcp_dot}</span><span class="status-label">MCP 通道</span></div>
-  <div class="model">主模型：{html.escape(model)}</div>
+  <div class="model">接口模式：{html.escape(api_mode)}　·　主模型：{html.escape(model)}</div>
 </div></section>{msg}
 <section class="card upload"><form action="/upload" method="post" enctype="multipart/form-data">
   <div class="file-row"><label class="file-label">▣ 选择视频<input id="videoInput" type="file" name="video" accept="video/*" required></label><span id="fileName" class="filename">未选择任何文件</span></div>
@@ -187,7 +188,7 @@ def upload(video: UploadFile = File(...)):
                 f.write(chunk)
 
         report = analyze_video(temp_path, video.filename or "video")
-        used = (report.get("models") or {}).get("video_audio_understanding") or "Gemini"
+        used = (report.get("models") or {}).get("video_audio_understanding") or "AI"
         note = ""
         first_error = report.get("primary_model_error_before_fallback")
         if first_error:
