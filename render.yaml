@@ -5,10 +5,8 @@ services:
     plan: free
     healthCheckPath: /health
     envVars:
-      - key: APP_USERNAME
-        value: gongkan
-      - key: APP_PASSWORD
-        sync: false
+      # 公开版默认不使用网页用户名/密码。
+      # App 第一次只填写服务地址；MCP 仍由独立 token 路径保护。
       - key: MCP_PATH_TOKEN
         sync: false
 
@@ -23,13 +21,10 @@ services:
       - key: API_MODEL
         sync: false
 
-      # 可选：主模型失败时备用；留空即可
       - key: API_FALLBACK_MODEL
         value: ""
-      # OpenAI-compatible 模式用；不需要语音转写可留空
       - key: API_AUDIO_MODEL
         value: whisper-1
-      # Gemini-compatible 默认用 ?key=；少数中转如果要求 Bearer，可部署后改成 bearer
       - key: GEMINI_AUTH_STYLE
         value: query_key
 
