@@ -3,14 +3,15 @@ services:
     name: gongkan-public
     runtime: docker
     plan: free
+    autoDeploy: false
     healthCheckPath: /health
 
     envVars:
-      # 新手部署时只需要填写这一项
+      # 新手一键部署时由 Render 自动生成，不需要手填。
       - key: MCP_PATH_TOKEN
-        sync: false
+        generateValue: true
 
-      # API 由用户在「共看」App 里填写
+      # API 由用户在「共看」App 里填写。
       - key: API_MODE
         value: gemini
 
